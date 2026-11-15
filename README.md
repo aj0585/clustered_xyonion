@@ -1,3 +1,8 @@
+# CAVEAT
+
+This repository is generated entirely from an LLM for experimentation. Has
+not been technically checked.
+
 # clustered_xyonion
 
 A Python implementation of the **XYOnion** train/validation/test
