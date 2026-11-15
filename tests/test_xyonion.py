@@ -1,13 +1,13 @@
+"""Tests for the scikit-learn-facing splitter (needs scikit-learn 1.0.2)."""
+
 import numpy as np
 import pandas as pd
 import pytest
-from sklearn.base import clone
 from sklearn.cluster import KMeans
 from sklearn.linear_model import Ridge
-from sklearn.model_selection import GridSearchCV
-from sklearn.utils.estimator_checks import check_estimator
+from sklearn.model_selection import GridSearchCV, cross_validate
 
-from clustered_xyonion import XYOnion, xyonion_train_test_split
+from clustered_xyonion import HDBSCAN_KNN, XYOnionSplit, xyonion_train_test_split
 from clustered_xyonion._core import round_half_up
 
 
@@ -28,114 +28,125 @@ def make_strings(n_per=150, seed=0):
     return X, y
 
 
-# --- estimator ----------------------------------------------------------
+KMEANS2 = {"clustering": "kmeans", "clustering_params": {"n_clusters": 2}}
+
+
+# --- splitter -----------------------------------------------------------
 
 
 @pytest.mark.parametrize("metric", ["euclidean", "mahalanobis"])
-@pytest.mark.parametrize("clustering", [None, "kmeans", "hdbscan"])
-def test_fit_exact_test_fraction(metric, clustering):
+@pytest.mark.parametrize("clustering", [None, "kmeans"])
+def test_split_exact_test_fraction(metric, clustering):
     X, y = make_strings()
-    params = {"kmeans": {"n_clusters": 2}, "hdbscan": {"min_cluster_size": 20}}
-    est = XYOnion(
-        test_size=0.3,
-        metric=metric,
-        clustering=clustering,
-        clustering_params=params.get(clustering),
-        random_state=0,
-    ).fit(X, y)
-    assert est.test_mask_.sum() == round_half_up(0.3 * len(y))
-    assert len(est.train_indices_) + len(est.test_indices_) == len(y)
-    assert np.intersect1d(est.train_indices_, est.test_indices_).size == 0
+    params = {"n_clusters": 2} if clustering == "kmeans" else None
+    cv = XYOnionSplit(test_size=0.3, metric=metric, clustering=clustering,
+                      clustering_params=params, random_state=0)
+    (train, test), = list(cv.split(X, y))
+    assert len(test) == round_half_up(0.3 * len(y))
+    assert len(train) + len(test) == len(y)
+    assert np.intersect1d(train, test).size == 0
+
+
+def test_get_n_splits_and_repr():
+    cv = XYOnionSplit(test_size=0.2, random_state=1)
+    assert cv.get_n_splits() == 1
+    assert "XYOnionSplit(" in repr(cv) and "test_size=0.2" in repr(cv)
+
+
+def test_split_does_not_store_state():
+    X, y = make_data(40)
+    cv = XYOnionSplit(random_state=0)
+    list(cv.split(X, y))
+    assert vars(cv) == vars(XYOnionSplit(random_state=0))
 
 
 def test_clustered_split_is_stratified_per_cluster():
     X, y = make_strings(n_per=150)
-    est = XYOnion(
-        test_size=0.2, clustering="kmeans", clustering_params={"n_clusters": 2},
-        random_state=0,
-    ).fit(X, y)
-    for g in np.unique(est.cluster_labels_):
-        in_g = est.cluster_labels_ == g
-        assert est.test_mask_[in_g].sum() == round_half_up(0.2 * in_g.sum())
+    info = XYOnionSplit(test_size=0.2, random_state=0, **KMEANS2).split_info(X, y)
+    for g in np.unique(info.cluster_labels):
+        in_g = info.cluster_labels == g
+        assert info.test_mask[in_g].sum() == round_half_up(0.2 * in_g.sum())
         # Each cluster's own outermost layer is in train.
-        assert not est.test_mask_[in_g & (est.layer_ == 0)].any()
+        assert not info.test_mask[in_g & (info.layer == 0)].any()
 
 
 def test_layer_size_follows_loop_fraction():
     X, y = make_data(400)
-    est = XYOnion(test_size=0.25, loop_fraction=0.1, random_state=0).fit(X, y)
-    sizes = np.bincount(est.layer_[est.layer_ >= 0])
+    info = XYOnionSplit(test_size=0.25, loop_fraction=0.1, random_state=0).split_info(X, y)
+    sizes = np.bincount(info.layer[info.layer >= 0])
     assert (sizes == 10).all()  # round(0.1 * 0.25 * 400)
 
 
 def test_tiny_sample_uses_layers_of_one():
     X, y = make_data(12)
-    est = XYOnion(test_size=0.25, loop_fraction=0.1, random_state=0).fit(X, y)
-    sizes = np.bincount(est.layer_[est.layer_ >= 0])
+    info = XYOnionSplit(test_size=0.25, loop_fraction=0.1, random_state=0).split_info(X, y)
+    sizes = np.bincount(info.layer[info.layer >= 0])
     assert (sizes == 1).all()
-    assert est.test_mask_.sum() == 3
+    assert info.test_mask.sum() == 3
 
 
 def test_random_state_reproducible_and_passed_to_kmeans():
     X, y = make_strings()
     kw = dict(clustering="kmeans", clustering_params={"n_clusters": 3, "n_init": 1})
-    a = XYOnion(random_state=1, **kw).fit(X, y)
-    b = XYOnion(random_state=1, **kw).fit(X, y)
-    np.testing.assert_array_equal(a.test_mask_, b.test_mask_)
-    assert a.clusterer_.random_state == 1
+    a = XYOnionSplit(random_state=1, **kw).split_info(X, y)
+    b = XYOnionSplit(random_state=1, **kw).split_info(X, y)
+    np.testing.assert_array_equal(a.test_mask, b.test_mask)
+    assert a.clusterer.random_state == 1
 
 
 def test_explicit_clusterer_random_state_is_respected():
     X, y = make_strings()
-    est = XYOnion(clustering=KMeans(n_clusters=2, random_state=7), random_state=1)
-    est.fit(X, y)
-    assert est.clusterer_.random_state == 7
+    cv = XYOnionSplit(clustering=KMeans(n_clusters=2, random_state=7), random_state=1)
+    assert cv.split_info(X, y).clusterer.random_state == 7
 
 
-def test_nested_clusterer_params_via_set_params():
-    est = XYOnion(clustering=KMeans(n_clusters=2))
-    est.set_params(clustering__n_clusters=4)
-    assert est.clustering.n_clusters == 4
+def test_clustering_params_override_instance_without_mutating_it():
     X, y = make_strings()
-    est.fit(X, y)
-    assert len(np.unique(est.cluster_labels_)) == 4
+    km = KMeans(n_clusters=2)
+    cv = XYOnionSplit(clustering=km, clustering_params={"n_clusters": 3})
+    assert cv.split_info(X, y).clusterer.n_clusters == 3
+    assert km.n_clusters == 2
 
 
-def test_clustering_params_override_instance():
+# --- HDBSCAN_KNN placeholder --------------------------------------------
+
+
+def test_hdbscan_params_including_n_neighbors_are_passed_down():
+    cv = XYOnionSplit(
+        clustering="hdbscan",
+        clustering_params={"min_cluster_size": 20, "n_neighbors": 7},
+    )
+    clusterer = cv._make_clusterer()
+    assert isinstance(clusterer, HDBSCAN_KNN)
+    assert clusterer.min_cluster_size == 20
+    assert clusterer.n_neighbors == 7
+    assert "random_state" not in clusterer.get_params()
+
+
+def test_hdbscan_is_a_stub_for_now():
     X, y = make_strings()
-    est = XYOnion(clustering=KMeans(n_clusters=2), clustering_params={"n_clusters": 3})
-    est.fit(X, y)
-    assert est.clusterer_.n_clusters == 3
-    assert est.clustering.n_clusters == 2  # not mutated
+    with pytest.raises(NotImplementedError, match="placeholder"):
+        list(XYOnionSplit(clustering="hdbscan").split(X, y))
+
+
+# --- validation ---------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "bad_y, match",
-    [
-        (None, "requires y"),
-        (np.array([]), "non-empty"),
-        (np.zeros((20, 2)), "single response"),
-    ],
+    [(None, "requires y"), ([], "non-empty"), (np.zeros((20, 2)), "single response")],
 )
 def test_y_validation(bad_y, match):
     X, _ = make_data(20)
-    if bad_y is not None and bad_y.size == 0:
-        X = X[:0]
     with pytest.raises(ValueError, match=match):
-        XYOnion().fit(X, bad_y)
-
-
-def test_empty_y_with_nonempty_X():
-    X, _ = make_data(20)
-    with pytest.raises(ValueError, match="non-empty"):
-        XYOnion().fit(X, [])
+        list(XYOnionSplit().split(X, bad_y))
 
 
 def test_column_vector_y_accepted():
     X, y = make_data(40)
-    a = XYOnion(random_state=0).fit(X, y)
-    b = XYOnion(random_state=0).fit(X, y.reshape(-1, 1))
-    np.testing.assert_array_equal(a.test_mask_, b.test_mask_)
+    a = XYOnionSplit(random_state=0).split_info(X, y)
+    b = XYOnionSplit(random_state=0).split_info(X, y.reshape(-1, 1))
+    np.testing.assert_array_equal(a.test_mask, b.test_mask)
 
 
 @pytest.mark.parametrize(
@@ -143,66 +154,67 @@ def test_column_vector_y_accepted():
     [
         {"test_size": 0.0},
         {"test_size": 1.0},
+        {"test_size": 10},
         {"loop_fraction": 0.0},
         {"metric": "cosine"},
         {"clustering": "dbscan"},
+        {"clustering": object()},
+        {"clustering_params": [("n_clusters", 2)]},
     ],
 )
 def test_invalid_params(params):
     X, y = make_data(40)
     with pytest.raises(ValueError):
-        XYOnion(**params).fit(X, y)
+        list(XYOnionSplit(**params).split(X, y))
 
 
-def test_transform_and_fit_transform():
-    X, y = make_data(40)
-    est = XYOnion(random_state=0)
-    out = est.fit_transform(X, y)
-    assert out.shape == (40, 1)
-    np.testing.assert_array_equal(out.ravel().astype(bool), est.test_mask_)
-    assert list(est.get_feature_names_out()) == ["is_test"]
-    with pytest.raises(ValueError, match="samples passed to fit"):
-        est.transform(X[:10])
+def test_too_few_samples_for_both_sets():
+    X, y = make_data(2)
+    with pytest.raises(ValueError, match="non-empty"):
+        list(XYOnionSplit(test_size=0.1).split(X, y))
 
 
-def test_split_as_cv():
+# --- train_test_split-style helper --------------------------------------
+
+
+def test_train_test_split_numpy():
+    X, y = make_data(60)
+    w = np.arange(60)
+    X_tr, X_te, y_tr, y_te, w_tr, w_te = xyonion_train_test_split(
+        X, y, w, test_size=0.2, random_state=0
+    )
+    assert X_te.shape == (12, 2) and y_tr.shape == (48,)
+    np.testing.assert_array_equal(X[w_te], X_te)  # extra array split the same way
+
+
+def test_train_test_split_pandas_keeps_types():
+    X, y = make_data(60)
+    Xdf, ys = pd.DataFrame(X, columns=["a", "b"]), pd.Series(y)
+    X_tr, X_te, y_tr, y_te = xyonion_train_test_split(Xdf, ys, random_state=0, **KMEANS2)
+    assert isinstance(X_tr, pd.DataFrame) and isinstance(y_te, pd.Series)
+    assert list(X_tr.index) == list(y_tr.index)
+
+
+def test_train_test_split_matches_splitter():
+    X, y = make_strings()
+    _, X_te, _, _ = xyonion_train_test_split(X, y, random_state=0, **KMEANS2)
+    (_, test), = list(XYOnionSplit(random_state=0, **KMEANS2).split(X, y))
+    np.testing.assert_array_equal(X_te, X[test])
+
+
+def test_inconsistent_lengths():
+    X, y = make_data(20)
+    with pytest.raises(ValueError):
+        xyonion_train_test_split(X, y[:10])
+
+
+# --- use as cv -----------------------------------------------------------
+
+
+def test_usable_as_cv():
     X, y = make_data(80)
-    cv = XYOnion(random_state=0)
-    assert cv.get_n_splits() == 1
-    (train, test), = list(cv.split(X, y))
-    assert len(test) == 20
-    assert not hasattr(cv, "test_mask_")  # split fits a clone
+    cv = XYOnionSplit(random_state=0)
     search = GridSearchCV(Ridge(), {"alpha": [0.1, 1.0]}, cv=cv).fit(X, y)
     assert search.n_splits_ == 1
-
-
-def test_train_test_split_helper_numpy_and_pandas():
-    X, y = make_data(60)
-    Xtr, Xte, ytr, yte = xyonion_train_test_split(X, y, test_size=0.2, random_state=0)
-    assert Xte.shape == (12, 2) and ytr.shape == (48,)
-    Xdf, ys = pd.DataFrame(X, columns=["a", "b"]), pd.Series(y)
-    Xtr, Xte, ytr, yte = xyonion_train_test_split(Xdf, ys, random_state=0)
-    assert isinstance(Xtr, pd.DataFrame) and isinstance(yte, pd.Series)
-
-
-def test_get_params_and_clone():
-    est = XYOnion(test_size=0.3, loop_fraction=0.05, metric="mahalanobis",
-                  clustering="hdbscan", clustering_params={"min_cluster_size": 5},
-                  random_state=3)
-    assert clone(est).get_params() == est.get_params()
-
-
-def test_sklearn_check_estimator():
-    # Runs scikit-learn's API conformance suite. Checks that make no sense for
-    # a splitter whose transform only applies to the fitted samples are
-    # expected to fail and listed here.
-    expected_failed = {
-        "check_transformer_general": "transform only defined on fitted samples",
-        "check_methods_subset_invariance": "transform only defined on fitted samples",
-        "check_methods_sample_order_invariance": "split depends on the whole sample set",
-    }
-    check_estimator(
-        XYOnion(random_state=0),
-        expected_failed_checks=expected_failed,
-        on_fail="raise",
-    )
+    res = cross_validate(Ridge(), X, y, cv=cv)
+    assert len(res["test_score"]) == 1
