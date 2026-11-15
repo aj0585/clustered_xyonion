@@ -1,0 +1,46 @@
+{
+  "env": {
+    "UV_FROZEN": "1",
+    "UV_OFFLINE": "1"
+  },
+  "permissions": {
+    "deny": [
+      "Bash(uv add *)",
+      "Bash(uv remove *)",
+      "Bash(uv sync *)",
+      "Bash(uv sync)",
+      "Bash(uv lock *)",
+      "Bash(uv lock)",
+      "Bash(uv pip install *)",
+      "Bash(uv pip sync *)",
+      "Bash(uv tool install *)",
+      "Bash(uvx *)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(python -m pip install *)",
+      "Bash(uv run pip install *)",
+      "Bash(uv run python -m pip install *)",
+      "Bash(conda install *)",
+      "Bash(conda create *)",
+      "Bash(mamba install *)",
+      "PowerShell(uv add *)",
+      "PowerShell(uv remove *)",
+      "PowerShell(uv sync *)",
+      "PowerShell(uv sync)",
+      "PowerShell(uv lock *)",
+      "PowerShell(uv lock)",
+      "PowerShell(uv pip install *)",
+      "PowerShell(uv pip sync *)",
+      "PowerShell(uv tool install *)",
+      "PowerShell(uvx *)",
+      "PowerShell(pip install *)",
+      "PowerShell(pip3 install *)",
+      "PowerShell(python -m pip install *)",
+      "PowerShell(uv run pip install *)",
+      "PowerShell(uv run python -m pip install *)",
+      "PowerShell(conda install *)",
+      "PowerShell(conda create *)",
+      "PowerShell(mamba install *)"
+    ]
+  }
+}
