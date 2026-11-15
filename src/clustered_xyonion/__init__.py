@@ -1,11 +1,17 @@
 """Clustered XYOnion: layer-based train/test splitting for non-convex data."""
 
-__all__ = ["XYOnionSplit", "xyonion_train_test_split", "HDBSCAN_KNN"]
+__all__ = [
+    "XYOnionSplit",
+    "xyonion_train_test_split",
+    "xyonion_train_val_test_split",
+    "HDBSCAN_KNN",
+]
 __version__ = "0.1.0"
 
 _SOURCES = {
     "XYOnionSplit": "xyonion",
     "xyonion_train_test_split": "xyonion",
+    "xyonion_train_val_test_split": "xyonion",
     "HDBSCAN_KNN": "_clusterers",
 }
 

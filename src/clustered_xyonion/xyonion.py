@@ -1,4 +1,4 @@
-"""(Clustered) XYOnion train/test splitting, in the style of
+"""(Clustered) XYOnion train/validation/test splitting, in the style of
 ``sklearn.model_selection.train_test_split`` and ``ShuffleSplit``.
 
 Written for scikit-learn 1.0.2.
@@ -18,7 +18,10 @@ from sklearn.utils.validation import check_array, indexable
 from ._clusterers import HDBSCAN_KNN
 from ._core import (
     METRICS,
-    apportion_test_counts,
+    TEST,
+    TRAIN,
+    VALIDATION,
+    apportion_counts,
     round_half_up,
     xyonion_group_split,
 )
@@ -45,28 +48,39 @@ def _check_y(y, n_samples: int) -> np.ndarray:
     return y.astype(float, copy=False)
 
 
+def _is_float(value) -> bool:
+    return isinstance(value, Real) and not isinstance(value, (bool, Integral))
+
+
 class XYOnionSplit(BaseCrossValidator):
-    """XYOnion train/test splitter, optionally run separately on each cluster.
+    """XYOnion train/(validation/)test splitter, optionally run per cluster.
 
     The standard XYOnion method assumes a roughly convex data set. For data
     with complex (e.g. long, string-like) clusters, set ``clustering`` so the
     data is first given hard cluster labels; XYOnion then runs on each cluster
-    on its own and the per-cluster train/test sets are recombined.
+    on its own and the per-cluster subsets are recombined.
 
-    Like ``ShuffleSplit`` with ``n_splits=1``, this yields a single
-    ``(train_indices, test_indices)`` pair, so it can be passed as ``cv`` to
-    ``GridSearchCV``, ``cross_validate`` etc. Use
-    :func:`xyonion_train_test_split` for a ``train_test_split``-style call.
+    With ``validation_fraction=0`` (the default) this works like
+    ``ShuffleSplit(n_splits=1)``: ``split`` yields one ``(train, test)`` pair,
+    so it can be passed as ``cv`` to ``GridSearchCV``, ``cross_validate`` etc.
+    With a validation set, use :meth:`split_info` or
+    :func:`xyonion_train_val_test_split` instead.
 
     Parameters
     ----------
-    test_size : float in (0, 1), default=0.25
-        Fraction of samples placed in the test (validation) set. The test count
-        is ``round(test_size * n_samples)`` overall, apportioned across clusters
-        with the largest-remainder method so the total is exact.
+    test_fraction : float in (0, 1), default=0.25
+        Fraction of samples placed in the test set. The overall test count is
+        ``round(test_fraction * n_samples)``, shared across clusters so the
+        total is exact.
+    validation_fraction : float in [0, 1), default=0.0
+        Fraction of samples placed in the validation set (0 = no validation
+        set). ``test_fraction + validation_fraction`` must be below 1.
     loop_fraction : float in (0, 1], default=0.1
-        Each layer holds ``max(1, round(loop_fraction * test_size * n_k))``
-        samples, where ``n_k`` is the size of the cluster being split.
+        Sets the layer size: each layer holds
+        ``max(1, round(loop_fraction * f * n_k))`` samples, where ``n_k`` is
+        the size of the cluster being split and ``f`` is the smaller of the
+        non-zero held-out fractions (``test_fraction``, and
+        ``validation_fraction`` if used).
     metric : {"euclidean", "mahalanobis"}, default="euclidean"
         Distance used in the X and y blocks within each cluster.
     clustering : {None, "kmeans", "hdbscan"} or estimator, default=None
@@ -88,14 +102,16 @@ class XYOnionSplit(BaseCrossValidator):
 
     def __init__(
         self,
-        test_size=0.25,
+        test_fraction=0.25,
+        validation_fraction=0.0,
         loop_fraction=0.1,
         metric="euclidean",
         clustering=None,
         clustering_params=None,
         random_state=None,
     ):
-        self.test_size = test_size
+        self.test_fraction = test_fraction
+        self.validation_fraction = validation_fraction
         self.loop_fraction = loop_fraction
         self.metric = metric
         self.clustering = clustering
@@ -105,14 +121,21 @@ class XYOnionSplit(BaseCrossValidator):
     # --- validation -----------------------------------------------------
 
     def _validate_params(self):
-        def is_real(v):
-            return isinstance(v, Real) and not isinstance(v, (bool, Integral))
-
-        if not (is_real(self.test_size) and 0 < self.test_size < 1):
+        if not (_is_float(self.test_fraction) and 0 < self.test_fraction < 1):
             raise ValueError(
-                f"test_size must be a float in (0, 1), got {self.test_size!r}."
+                f"test_fraction must be a float in (0, 1), got {self.test_fraction!r}."
             )
-        if not (is_real(self.loop_fraction) and 0 < self.loop_fraction <= 1):
+        vf = self.validation_fraction
+        if not ((_is_float(vf) or vf == 0) and not isinstance(vf, bool) and 0 <= vf < 1):
+            raise ValueError(
+                f"validation_fraction must be a float in [0, 1), got {vf!r}."
+            )
+        if self.test_fraction + vf >= 1:
+            raise ValueError(
+                f"test_fraction + validation_fraction must be below 1, got "
+                f"{self.test_fraction} + {vf}."
+            )
+        if not (_is_float(self.loop_fraction) and 0 < self.loop_fraction <= 1):
             raise ValueError(
                 f"loop_fraction must be a float in (0, 1], got {self.loop_fraction!r}."
             )
@@ -162,8 +185,10 @@ class XYOnionSplit(BaseCrossValidator):
         Returns
         -------
         info : sklearn.utils.Bunch with keys
-            ``train_indices``, ``test_indices`` : ndarray of int
-            ``test_mask`` : ndarray of bool, True where a sample is in test
+            ``train_indices``, ``validation_indices``, ``test_indices`` :
+            ndarray of int (``validation_indices`` is empty when
+            ``validation_fraction=0``)
+            ``subset`` : ndarray of int, 0 = train, 1 = validation, 2 = test
             ``cluster_labels`` : hard cluster label of each sample (all zeros
             when ``clustering=None``)
             ``layer`` : layer index within the sample's cluster (0 =
@@ -174,13 +199,16 @@ class XYOnionSplit(BaseCrossValidator):
         X = check_array(X, dtype="numeric", ensure_min_samples=2)
         y = _check_y(y, X.shape[0])
         n_samples = X.shape[0]
+        tf, vf = self.test_fraction, self.validation_fraction
 
-        n_test_total = round_half_up(self.test_size * n_samples)
-        if not 0 < n_test_total < n_samples:
+        n_test_total = round_half_up(tf * n_samples)
+        n_val_total = round_half_up(vf * n_samples)
+        if n_test_total < 1 or n_test_total + n_val_total >= n_samples or (vf > 0 and n_val_total < 1):
             raise ValueError(
-                f"test_size={self.test_size} with n_samples={n_samples} gives "
-                f"{n_test_total} test samples; both train and test sets must "
-                "be non-empty."
+                f"test_fraction={tf} and validation_fraction={vf} with "
+                f"n_samples={n_samples} give {n_samples - n_test_total - n_val_total} "
+                f"train, {n_val_total} validation and {n_test_total} test samples; "
+                "every requested set must be non-empty."
             )
 
         clusterer = self._make_clusterer()
@@ -193,23 +221,31 @@ class XYOnionSplit(BaseCrossValidator):
         # is split as its own group.
         groups = np.unique(labels)
         members = [np.flatnonzero(labels == g) for g in groups]
-        n_test_per_group = apportion_test_counts([m.size for m in members], self.test_size)
+        sizes = np.array([m.size for m in members])
+        n_test_per_group = apportion_counts(sizes, tf)
+        n_val_per_group = apportion_counts(sizes, vf, capacity=sizes - n_test_per_group)
+
+        # Layer size is set by the smallest held-out set, so it gets several
+        # layers rather than one or two big ones.
+        layer_fraction = min(tf, vf) if vf > 0 else tf
 
         rng = check_random_state(self.random_state)
-        test_mask = np.zeros(n_samples, dtype=bool)
+        subset = np.full(n_samples, TRAIN, dtype=int)
         layer = np.full(n_samples, -1, dtype=int)
-        for idx, n_test in zip(members, n_test_per_group):
-            layer_size = max(1, round_half_up(self.loop_fraction * self.test_size * idx.size))
-            group_test, group_layer = xyonion_group_split(
-                X[idx], y[idx], int(n_test), layer_size, self.metric, rng
+        for idx, n_test, n_val in zip(members, n_test_per_group, n_val_per_group):
+            layer_size = max(1, round_half_up(self.loop_fraction * layer_fraction * idx.size))
+            group_subset, group_layer = xyonion_group_split(
+                X[idx], y[idx], int(n_test), layer_size, self.metric, rng,
+                n_validation=int(n_val),
             )
-            test_mask[idx] = group_test
+            subset[idx] = group_subset
             layer[idx] = group_layer
 
         return Bunch(
-            train_indices=np.flatnonzero(~test_mask),
-            test_indices=np.flatnonzero(test_mask),
-            test_mask=test_mask,
+            train_indices=np.flatnonzero(subset == TRAIN),
+            validation_indices=np.flatnonzero(subset == VALIDATION),
+            test_indices=np.flatnonzero(subset == TEST),
+            subset=subset,
             cluster_labels=labels,
             layer=layer,
             clusterer=clusterer,
@@ -217,6 +253,9 @@ class XYOnionSplit(BaseCrossValidator):
 
     def split(self, X, y=None, groups=None):
         """Yield one ``(train_indices, test_indices)`` pair.
+
+        Only available with ``validation_fraction=0``; for three subsets use
+        :meth:`split_info` or :func:`xyonion_train_val_test_split`.
 
         Parameters
         ----------
@@ -226,19 +265,32 @@ class XYOnionSplit(BaseCrossValidator):
         groups : ignored
             Present for API compatibility.
         """
+        if self.validation_fraction:
+            raise ValueError(
+                "split() yields (train, test) pairs, so it needs "
+                "validation_fraction=0. Use split_info() or "
+                "xyonion_train_val_test_split() for train/validation/test."
+            )
         info = self.split_info(X, y)
         yield info.train_indices, info.test_indices
 
     def get_n_splits(self, X=None, y=None, groups=None):
-        """Always 1: XYOnion produces a single train/test split."""
+        """Always 1: XYOnion produces a single split."""
         return 1
+
+
+def _split_arrays(index_sets, X, y, arrays):
+    out = []
+    for a in (X, y, *arrays):
+        out.extend(_safe_indexing(a, idx) for idx in index_sets)
+    return out
 
 
 def xyonion_train_test_split(
     X,
     y,
     *arrays,
-    test_size=0.25,
+    test_fraction=0.25,
     loop_fraction=0.1,
     metric="euclidean",
     clustering=None,
@@ -256,7 +308,7 @@ def xyonion_train_test_split(
     X : array-like of shape (n_samples, n_features)
     y : array-like of shape (n_samples,) or (n_samples, 1)
     *arrays : further indexables with the same number of samples
-    test_size, loop_fraction, metric, clustering, clustering_params, random_state
+    test_fraction, loop_fraction, metric, clustering, clustering_params, random_state
         See :class:`XYOnionSplit`.
 
     Returns
@@ -266,16 +318,64 @@ def xyonion_train_test_split(
         output keeps its input's type (pandas objects stay pandas objects).
     """
     X, y, *arrays = indexable(X, y, *arrays)
-    splitter = XYOnionSplit(
-        test_size=test_size,
+    info = XYOnionSplit(
+        test_fraction=test_fraction,
         loop_fraction=loop_fraction,
         metric=metric,
         clustering=clustering,
         clustering_params=clustering_params,
         random_state=random_state,
-    )
-    train, test = next(splitter.split(X, y))
-    out = []
-    for a in (X, y, *arrays):
-        out.extend((_safe_indexing(a, train), _safe_indexing(a, test)))
-    return out
+    ).split_info(X, y)
+    return _split_arrays((info.train_indices, info.test_indices), X, y, arrays)
+
+
+def xyonion_train_val_test_split(
+    X,
+    y,
+    *arrays,
+    test_fraction=0.2,
+    validation_fraction=0.2,
+    loop_fraction=0.1,
+    metric="euclidean",
+    clustering=None,
+    clustering_params=None,
+    random_state=None,
+):
+    """Split arrays into train, validation and test subsets with XYOnion.
+
+    Like :func:`xyonion_train_test_split` with a third subset. Validation and
+    test are treated the same way: both get layers from every depth of the
+    data, and the outermost layer always goes to train.
+
+    Parameters
+    ----------
+    X : array-like of shape (n_samples, n_features)
+    y : array-like of shape (n_samples,) or (n_samples, 1)
+    *arrays : further indexables with the same number of samples
+    test_fraction : float in (0, 1), default=0.2
+    validation_fraction : float in (0, 1), default=0.2
+    loop_fraction, metric, clustering, clustering_params, random_state
+        See :class:`XYOnionSplit`.
+
+    Returns
+    -------
+    splitting : list, length 3 * (2 + len(arrays))
+        ``[X_train, X_val, X_test, y_train, y_val, y_test, ...]``.
+    """
+    if not (_is_float(validation_fraction) and validation_fraction > 0):
+        raise ValueError(
+            "validation_fraction must be a float above 0; use "
+            "xyonion_train_test_split for a train/test split."
+        )
+    X, y, *arrays = indexable(X, y, *arrays)
+    info = XYOnionSplit(
+        test_fraction=test_fraction,
+        validation_fraction=validation_fraction,
+        loop_fraction=loop_fraction,
+        metric=metric,
+        clustering=clustering,
+        clustering_params=clustering_params,
+        random_state=random_state,
+    ).split_info(X, y)
+    index_sets = (info.train_indices, info.validation_indices, info.test_indices)
+    return _split_arrays(index_sets, X, y, arrays)
