@@ -1,16 +1,21 @@
-"""scikit-learn compatible (clustered) XYOnion train/test splitter."""
+"""(Clustered) XYOnion train/test splitting, in the style of
+``sklearn.model_selection.train_test_split`` and ``ShuffleSplit``.
+
+Written for scikit-learn 1.0.2.
+"""
 
 from __future__ import annotations
 
 from numbers import Integral, Real
 
 import numpy as np
-from sklearn.base import BaseEstimator, TransformerMixin, clone
-from sklearn.cluster import HDBSCAN, KMeans
-from sklearn.utils import check_random_state
-from sklearn.utils._param_validation import Interval, StrOptions, HasMethods
-from sklearn.utils.validation import check_array, check_is_fitted, validate_data
+from sklearn.base import clone
+from sklearn.cluster import KMeans
+from sklearn.model_selection import BaseCrossValidator
+from sklearn.utils import Bunch, _safe_indexing, check_random_state
+from sklearn.utils.validation import check_array, indexable
 
+from ._clusterers import HDBSCAN_KNN
 from ._core import (
     METRICS,
     apportion_test_counts,
@@ -18,7 +23,7 @@ from ._core import (
     xyonion_group_split,
 )
 
-CLUSTERERS = {"kmeans": KMeans, "hdbscan": HDBSCAN}
+CLUSTERERS = {"kmeans": KMeans, "hdbscan": HDBSCAN_KNN}
 
 
 def _check_y(y, n_samples: int) -> np.ndarray:
@@ -35,20 +40,23 @@ def _check_y(y, n_samples: int) -> np.ndarray:
             f"XYOnion requires a single response column; got y with shape {y.shape}."
         )
     if y.shape[0] != n_samples:
-        raise ValueError(
-            f"X has {n_samples} samples but y has {y.shape[0]}."
-        )
-    y = check_array(y, ensure_2d=False, dtype="numeric", input_name="y")
+        raise ValueError(f"X has {n_samples} samples but y has {y.shape[0]}.")
+    y = check_array(y, ensure_2d=False, dtype="numeric")
     return y.astype(float, copy=False)
 
 
-class XYOnion(TransformerMixin, BaseEstimator):
-    """XYOnion train/test splitting, optionally run separately on each cluster.
+class XYOnionSplit(BaseCrossValidator):
+    """XYOnion train/test splitter, optionally run separately on each cluster.
 
     The standard XYOnion method assumes a roughly convex data set. For data
     with complex (e.g. long, string-like) clusters, set ``clustering`` so the
     data is first given hard cluster labels; XYOnion then runs on each cluster
     on its own and the per-cluster train/test sets are recombined.
+
+    Like ``ShuffleSplit`` with ``n_splits=1``, this yields a single
+    ``(train_indices, test_indices)`` pair, so it can be passed as ``cv`` to
+    ``GridSearchCV``, ``cross_validate`` etc. Use
+    :func:`xyonion_train_test_split` for a ``train_test_split``-style call.
 
     Parameters
     ----------
@@ -62,56 +70,21 @@ class XYOnion(TransformerMixin, BaseEstimator):
     metric : {"euclidean", "mahalanobis"}, default="euclidean"
         Distance used in the X and y blocks within each cluster.
     clustering : {None, "kmeans", "hdbscan"} or estimator, default=None
-        Pre-clustering step. ``None`` runs plain XYOnion on the whole data set.
-        An estimator instance must provide ``fit_predict``; its parameters can
-        then be set through this estimator, e.g. ``clustering__n_clusters``.
-        HDBSCAN noise points (label -1) are treated as one extra group.
+        Pre-clustering step, run on X only. ``None`` runs plain XYOnion on the
+        whole data set. ``"kmeans"`` uses ``sklearn.cluster.KMeans``;
+        ``"hdbscan"`` uses :class:`HDBSCAN_KNN` (currently a placeholder that
+        raises ``NotImplementedError``). Any estimator with ``fit_predict`` is
+        accepted; it is cloned, never modified.
     clustering_params : dict, default=None
-        Keyword arguments for the clustering algorithm named by ``clustering``
-        (e.g. ``{"n_clusters": 5}`` for kmeans, ``{"min_cluster_size": 20}``
-        for hdbscan). Applied on top of an estimator instance's own params.
+        Keyword arguments for the clustering algorithm, e.g.
+        ``{"n_clusters": 5}`` for kmeans or
+        ``{"min_cluster_size": 20, "n_neighbors": 5}`` for hdbscan. Applied on
+        top of an estimator instance's own parameters.
     random_state : int, RandomState instance or None, default=None
         Controls every source of randomness: the random split of the final
         core samples in each cluster and, where it has a ``random_state``
         parameter that isn't set explicitly, the clustering algorithm.
-
-    Attributes
-    ----------
-    test_mask_ : ndarray of bool, shape (n_samples,)
-        True where the fitted sample is in the test set.
-    train_indices_, test_indices_ : ndarray of int
-        Indices of the fitted samples in the train and test sets.
-    cluster_labels_ : ndarray of int, shape (n_samples,)
-        Hard cluster labels used (all zeros when ``clustering=None``).
-    layer_ : ndarray of int, shape (n_samples,)
-        Layer index within the sample's cluster (0 = outermost), or -1 if the
-        sample was assigned in the final random split.
-    clusterer_ : estimator or None
-        The fitted clustering estimator.
-    n_features_in_ : int
-    feature_names_in_ : ndarray of str
-        Only defined when X has string feature names.
-
-    Notes
-    -----
-    ``transform`` returns the test-set indicator of the *fitted* samples as a
-    single 0/1 column, so ``fit_transform(X, y)`` gives the split directly. Use
-    ``split`` to use it as a ``cv`` argument, or :func:`xyonion_train_test_split`
-    for a drop-in replacement of ``sklearn.model_selection.train_test_split``.
     """
-
-    _parameter_constraints = {
-        "test_size": [Interval(Real, 0, 1, closed="neither")],
-        "loop_fraction": [Interval(Real, 0, 1, closed="right")],
-        "metric": [StrOptions(set(METRICS))],
-        "clustering": [
-            None,
-            StrOptions(set(CLUSTERERS)),
-            HasMethods(["fit_predict"]),
-        ],
-        "clustering_params": [dict, None],
-        "random_state": ["random_state"],
-    }
 
     def __init__(
         self,
@@ -129,12 +102,38 @@ class XYOnion(TransformerMixin, BaseEstimator):
         self.clustering_params = clustering_params
         self.random_state = random_state
 
-    def __sklearn_tags__(self):
-        tags = super().__sklearn_tags__()
-        tags.target_tags.required = True
-        tags.target_tags.single_output = True
-        tags.target_tags.multi_output = False
-        return tags
+    # --- validation -----------------------------------------------------
+
+    def _validate_params(self):
+        def is_real(v):
+            return isinstance(v, Real) and not isinstance(v, (bool, Integral))
+
+        if not (is_real(self.test_size) and 0 < self.test_size < 1):
+            raise ValueError(
+                f"test_size must be a float in (0, 1), got {self.test_size!r}."
+            )
+        if not (is_real(self.loop_fraction) and 0 < self.loop_fraction <= 1):
+            raise ValueError(
+                f"loop_fraction must be a float in (0, 1], got {self.loop_fraction!r}."
+            )
+        if self.metric not in METRICS:
+            raise ValueError(f"metric must be one of {METRICS}, got {self.metric!r}.")
+        if isinstance(self.clustering, str):
+            if self.clustering not in CLUSTERERS:
+                raise ValueError(
+                    f"clustering must be None, one of {sorted(CLUSTERERS)} or an "
+                    f"estimator with fit_predict; got {self.clustering!r}."
+                )
+        elif self.clustering is not None and not hasattr(self.clustering, "fit_predict"):
+            raise ValueError(
+                "clustering estimator must have a fit_predict method; got "
+                f"{type(self.clustering).__name__}."
+            )
+        if self.clustering_params is not None and not isinstance(self.clustering_params, dict):
+            raise ValueError(
+                f"clustering_params must be a dict or None, got "
+                f"{type(self.clustering_params).__name__}."
+            )
 
     def _make_clusterer(self):
         if self.clustering is None:
@@ -155,17 +154,24 @@ class XYOnion(TransformerMixin, BaseEstimator):
             clusterer.set_params(**params)
         return clusterer
 
-    def fit(self, X, y):
-        """Compute the train/test split of ``X`` and ``y``.
+    # --- the split ------------------------------------------------------
 
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-        y : array-like of shape (n_samples,) or (n_samples, 1)
-            Required, numeric, single response.
+    def split_info(self, X, y):
+        """Compute the split and return it with diagnostics.
+
+        Returns
+        -------
+        info : sklearn.utils.Bunch with keys
+            ``train_indices``, ``test_indices`` : ndarray of int
+            ``test_mask`` : ndarray of bool, True where a sample is in test
+            ``cluster_labels`` : hard cluster label of each sample (all zeros
+            when ``clustering=None``)
+            ``layer`` : layer index within the sample's cluster (0 =
+            outermost), or -1 if assigned in the final random split
+            ``clusterer`` : the fitted clustering estimator, or None
         """
         self._validate_params()
-        X = validate_data(self, X, dtype="numeric", ensure_min_samples=2)
+        X = check_array(X, dtype="numeric", ensure_min_samples=2)
         y = _check_y(y, X.shape[0])
         n_samples = X.shape[0]
 
@@ -177,12 +183,14 @@ class XYOnion(TransformerMixin, BaseEstimator):
                 "be non-empty."
             )
 
-        self.clusterer_ = self._make_clusterer()
-        if self.clusterer_ is None:
+        clusterer = self._make_clusterer()
+        if clusterer is None:
             labels = np.zeros(n_samples, dtype=int)
         else:
-            labels = np.asarray(self.clusterer_.fit_predict(X), dtype=int)
+            labels = np.asarray(clusterer.fit_predict(X), dtype=int)
 
+        # Each distinct label (including -1, should a clusterer return noise)
+        # is split as its own group.
         groups = np.unique(labels)
         members = [np.flatnonzero(labels == g) for g in groups]
         n_test_per_group = apportion_test_counts([m.size for m in members], self.test_size)
@@ -198,62 +206,76 @@ class XYOnion(TransformerMixin, BaseEstimator):
             test_mask[idx] = group_test
             layer[idx] = group_layer
 
-        self.cluster_labels_ = labels
-        self.test_mask_ = test_mask
-        self.layer_ = layer
-        self.train_indices_ = np.flatnonzero(~test_mask)
-        self.test_indices_ = np.flatnonzero(test_mask)
-        return self
-
-    def transform(self, X):
-        """Return the test-set indicator (1 = test, 0 = train) of the fitted
-        samples as an array of shape (n_samples, 1).
-
-        ``X`` must be the data passed to ``fit``; a split cannot be extended to
-        new samples.
-        """
-        check_is_fitted(self, "test_mask_")
-        X = validate_data(self, X, dtype="numeric", reset=False)
-        if X.shape[0] != self.test_mask_.shape[0]:
-            raise ValueError(
-                f"transform expects the {self.test_mask_.shape[0]} samples "
-                f"passed to fit, got {X.shape[0]}."
-            )
-        return self.test_mask_.astype(int).reshape(-1, 1)
-
-    def get_feature_names_out(self, input_features=None):
-        """Name of the single output column."""
-        check_is_fitted(self, "test_mask_")
-        return np.asarray(["is_test"], dtype=object)
-
-    # --- cross-validator interface (usable as ``cv=``) -------------------
+        return Bunch(
+            train_indices=np.flatnonzero(~test_mask),
+            test_indices=np.flatnonzero(test_mask),
+            test_mask=test_mask,
+            cluster_labels=labels,
+            layer=layer,
+            clusterer=clusterer,
+        )
 
     def split(self, X, y=None, groups=None):
-        """Yield one ``(train_indices, test_indices)`` pair, so this object can
-        be passed as ``cv`` to ``GridSearchCV``, ``cross_validate`` etc.
-        Fits a clone, so ``self`` is not modified."""
-        fitted = clone(self).fit(X, y)
-        yield fitted.train_indices_, fitted.test_indices_
+        """Yield one ``(train_indices, test_indices)`` pair.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+        y : array-like of shape (n_samples,) or (n_samples, 1)
+            Required (XYOnion uses it in its distance), numeric, single column.
+        groups : ignored
+            Present for API compatibility.
+        """
+        info = self.split_info(X, y)
+        yield info.train_indices, info.test_indices
 
     def get_n_splits(self, X=None, y=None, groups=None):
         """Always 1: XYOnion produces a single train/test split."""
         return 1
 
 
-def xyonion_train_test_split(X, y, **params):
-    """Split ``X`` and ``y`` with :class:`XYOnion`, like
-    ``sklearn.model_selection.train_test_split``.
+def xyonion_train_test_split(
+    X,
+    y,
+    *arrays,
+    test_size=0.25,
+    loop_fraction=0.1,
+    metric="euclidean",
+    clustering=None,
+    clustering_params=None,
+    random_state=None,
+):
+    """Split arrays into train and test subsets with (clustered) XYOnion.
 
-    ``params`` are passed to :class:`XYOnion`. Returns
-    ``X_train, X_test, y_train, y_test``, indexing the inputs as given (pandas
-    objects stay pandas objects).
+    Works like ``sklearn.model_selection.train_test_split``, except that ``X``
+    and ``y`` are required because XYOnion uses both to decide the split.
+    Any extra ``arrays`` (e.g. sample weights or IDs) are split the same way.
+
+    Parameters
+    ----------
+    X : array-like of shape (n_samples, n_features)
+    y : array-like of shape (n_samples,) or (n_samples, 1)
+    *arrays : further indexables with the same number of samples
+    test_size, loop_fraction, metric, clustering, clustering_params, random_state
+        See :class:`XYOnionSplit`.
+
+    Returns
+    -------
+    splitting : list, length 2 * (2 + len(arrays))
+        ``[X_train, X_test, y_train, y_test, a_train, a_test, ...]``. Each
+        output keeps its input's type (pandas objects stay pandas objects).
     """
-    splitter = XYOnion(**params).fit(X, y)
-    train, test = splitter.train_indices_, splitter.test_indices_
-
-    def take(a, idx):
-        if hasattr(a, "iloc"):
-            return a.iloc[idx]
-        return np.asarray(a)[idx]
-
-    return take(X, train), take(X, test), take(y, train), take(y, test)
+    X, y, *arrays = indexable(X, y, *arrays)
+    splitter = XYOnionSplit(
+        test_size=test_size,
+        loop_fraction=loop_fraction,
+        metric=metric,
+        clustering=clustering,
+        clustering_params=clustering_params,
+        random_state=random_state,
+    )
+    train, test = next(splitter.split(X, y))
+    out = []
+    for a in (X, y, *arrays):
+        out.extend((_safe_indexing(a, train), _safe_indexing(a, test)))
+    return out

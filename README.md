@@ -12,50 +12,51 @@ to training (so the test set is never extrapolated), and layers are shared
 between train and test so both sets span the whole data space.
 
 Standard XYOnion assumes the data set is roughly convex. The clustered variant
-first gives every sample a hard cluster label (kmeans or HDBSCAN), runs XYOnion
-on each cluster on its own, and recombines the per-cluster splits into one
-train set and one test set.
+first gives every sample a hard cluster label (kmeans or HDBSCAN + KNN), runs
+XYOnion on each cluster on its own, and recombines the per-cluster splits into
+one train set and one test set.
 
 ## Install
+
+Target environment: Python 3.9, numpy 1.21.5, scipy 1.7.3, scikit-learn 1.0.2
+(pinned in `pyproject.toml` and `uv.lock`). On Windows with Smart App Control
+on, build and run it inside WSL.
 
 ```bash
 uv sync
 ```
 
-or `pip install -e .`. Requires Python ≥ 3.10, numpy and scikit-learn ≥ 1.6.
-
 ## Usage
 
 ```python
-from clustered_xyonion import XYOnion, xyonion_train_test_split
+from clustered_xyonion import XYOnionSplit, xyonion_train_test_split
 
-# Drop-in replacement for sklearn.model_selection.train_test_split
+# Like sklearn.model_selection.train_test_split (X and y are required)
 X_train, X_test, y_train, y_test = xyonion_train_test_split(
     X, y,
     test_size=0.25,
     loop_fraction=0.1,
     metric="mahalanobis",          # or "euclidean"
-    clustering="hdbscan",          # or "kmeans", or None for plain XYOnion
-    clustering_params={"min_cluster_size": 20},
+    clustering="kmeans",           # or "hdbscan", None, or your own clusterer
+    clustering_params={"n_clusters": 5},
     random_state=0,
 )
 
-# As a scikit-learn estimator / transformer
-splitter = XYOnion(clustering="kmeans", clustering_params={"n_clusters": 5},
-                   random_state=0).fit(X, y)
-splitter.train_indices_, splitter.test_indices_   # the split
-splitter.cluster_labels_                            # clusters used
-splitter.layer_                                     # layer per sample (-1 = random core)
-is_test = splitter.fit_transform(X, y)              # (n_samples, 1) 0/1 column
+# Extra arrays are split the same way, as in train_test_split
+X_train, X_test, y_train, y_test, w_train, w_test = xyonion_train_test_split(
+    X, y, sample_weight, random_state=0)
 
-# As a cv object (one split)
+# As a splitter / cv object (one split, like ShuffleSplit(n_splits=1))
+cv = XYOnionSplit(clustering="kmeans", clustering_params={"n_clusters": 5},
+                  random_state=0)
+train_idx, test_idx = next(cv.split(X, y))
+
 from sklearn.model_selection import GridSearchCV
-GridSearchCV(model, grid, cv=XYOnion(random_state=0)).fit(X, y)
+GridSearchCV(model, grid, cv=cv).fit(X, y)
 
-# Clustering hyperparameters through the XYOnion API
-from sklearn.cluster import KMeans
-splitter = XYOnion(clustering=KMeans(n_clusters=3))
-splitter.set_params(clustering__n_clusters=6)
+# Diagnostics: cluster labels and layer of each sample
+info = cv.split_info(X, y)
+info.cluster_labels, info.layer, info.test_mask, info.clusterer
 ```
 
 ### Parameters
@@ -73,8 +74,20 @@ splitter.set_params(clustering__n_clusters=6)
 `(n, 1)`); a missing, empty or multi-column `y` raises `ValueError`.
 
 Clustering runs on `X` only, so scale `X` beforehand if its features have
-different units. HDBSCAN noise points (label −1) are split together as one
-extra group.
+different units.
+
+### Clustering options
+
+- `"kmeans"`: `sklearn.cluster.KMeans`; e.g.
+  `clustering_params={"n_clusters": 5}`.
+- `"hdbscan"`: `HDBSCAN_KNN`, which runs HDBSCAN and then assigns HDBSCAN's
+  noise points to clusters with a KNN vote, so every sample gets a hard label.
+  Parameters: `min_cluster_size`, `min_samples`, `cluster_selection_epsilon`,
+  `metric` and `n_neighbors` (neighbours used in the KNN vote), e.g.
+  `clustering_params={"min_cluster_size": 20, "n_neighbors": 5}`.
+  **Currently a placeholder:** it raises `NotImplementedError` when fitted.
+- If a clusterer does return noise labels (−1), those points are split
+  together as one extra group.
 
 ## Assumptions
 
@@ -105,3 +118,6 @@ all in `xyonion_group_split` in `src/clustered_xyonion/_core.py`:
 ```bash
 uv run pytest
 ```
+
+`tests/test_core.py` needs only numpy; `tests/test_xyonion.py` needs
+scikit-learn and pandas.
