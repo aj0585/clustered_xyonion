@@ -227,7 +227,9 @@ def plot_layers(ax, X, info, colorbar=True):
     """Colour each sample by how deep its onion layer is within its cluster."""
     depth = layer_depth(info)
     core = np.isnan(depth)
-    _scatter(ax, X[core], color=MUTED, marker="x", s=12, linewidths=0.8, label="random core")
+    # Most samples are usually NOT layered (with the defaults only ~27% are);
+    # show them as small grey dots so the layers stand out.
+    _scatter(ax, X[core], color=BASELINE, s=6, linewidths=0, label="random split (not layered)")
     points = _scatter(ax, X[~core], c=depth[~core], cmap=DEPTH_CMAP, vmin=0, vmax=1,
                       s=14, linewidths=0)
     n_layers = len(np.unique(info.layer[info.layer >= 0]))
@@ -323,7 +325,7 @@ def describe(cv) -> str:
     parts = [f"test_fraction={cv.test_fraction}"]
     if cv.validation_fraction:
         parts.append(f"validation_fraction={cv.validation_fraction}")
-    parts += [f"loop_fraction={cv.loop_fraction}", f"metric={cv.metric}",
+    parts += [f"n_onion={cv.n_onion}", f"loop_fraction={cv.loop_fraction}", f"metric={cv.metric}",
               f"clustering={clustering}"]
     if cv.clustering_params:
         parts.append(f"clustering_params={cv.clustering_params}")

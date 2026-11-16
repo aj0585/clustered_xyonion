@@ -1,29 +1,34 @@
-"""Core XYOnion layer-building routines operating on a single (convex) group.
+"""Core XYOnion routines operating on a single (roughly convex) group.
 
 Only numpy is needed here, so this module can be used and tested without
 scikit-learn.
 
-The XYOnion paper (Ezenarro, Anal. Chim. Acta 1364 (2025) 344229) leaves several
-details unspecified. Until the author's reference implementation is available,
-this module implements the following interim rules (see README "Assumptions"):
+This follows the author's reference MATLAB implementation, ``XYonion.m``
+(https://github.com/JokinEzenarro/XYOnion, MIT License, Copyright (c) 2025
+Jokin Ezenarro), of the method in Ezenarro, Anal. Chim. Acta 1364 (2025)
+344229:
 
-* Distances are the SPXY-style combined metric
-  ``d(p, q) = d_x(p, q) / max d_x + d_y(p, q) / max d_y`` where the maxima are
-  the maximum pairwise distances within the group, in Euclidean or Mahalanobis
-  form.
-* Each layer is filled with the ``layer_size`` remaining samples that are
-  furthest (by the combined metric) from the centroid. For the Euclidean metric
-  the centroid is recomputed from the remaining samples at every layer; for the
-  Mahalanobis metric it is computed once from the whole group.
-* The first layer goes to the train (calibration) set. Each following layer
-  goes to whichever subset (train, validation or test) is furthest below its
-  target share, never overshooting any subset's exact count.
-* Once fewer than ``layer_size`` samples remain (or no full layer fits in any
-  subset), the remaining samples are split at random so each subset's count is
-  exact.
+* The data is peeled in ``n_onion`` rounds. Each round takes one layer for
+  each subset, in the order train, test, validation. A layer for subset ``s``
+  holds ``round(loop_fraction * m0 * fraction_s)`` samples, where ``m0`` is the
+  number of samples still unassigned at the start of the round.
+* Each layer is chosen by DISTSLCT (:func:`distslct`), which picks spread-out
+  samples on the outside of the remaining data, using an SPXY-style combined X
+  and y distance. X and y are re-centred on the remaining samples for every
+  layer.
+* Whatever is left after the rounds is split at random.
 
-All of the interim rules live in :func:`xyonion_group_split` so they can be
-replaced when the reference implementation arrives.
+Differences from ``XYonion.m`` (all deliberate):
+
+* A validation set can be requested as well as train (calibration) and test.
+* The final random split hits each subset's exact count (the reference rounds
+  per layer and then uses ``ceil``, so its counts are approximate), and no
+  layer is allowed to overshoot a subset's count.
+* Mahalanobis whitening uses the pseudoinverse, so singular covariances work,
+  and is done per cluster by the caller.
+* DISTSLCT never picks the same sample twice and treats a block with no
+  spread (e.g. constant y) as contributing nothing, where the reference
+  could divide by zero.
 """
 
 from __future__ import annotations
@@ -36,9 +41,16 @@ METRICS = ("euclidean", "mahalanobis")
 TRAIN, VALIDATION, TEST = 0, 1, 2
 SUBSET_NAMES = ("train", "validation", "test")
 
+# Order in which each onion round takes its layers (train first, so the
+# outermost samples always go to train).
+LAYER_ORDER = (TRAIN, TEST, VALIDATION)
+
 
 def round_half_up(x: float) -> int:
-    """Round to the nearest integer, with halves rounded up (not to even)."""
+    """Round to the nearest integer, with halves rounded up (not to even).
+
+    Matches MATLAB's ``round`` for the non-negative values used here.
+    """
     return int(np.floor(x + 0.5))
 
 
@@ -115,6 +127,10 @@ def _whiten(X: np.ndarray) -> np.ndarray:
        so ``W = V @ diag(1 / sqrt(lam))``: rotate onto the principal
        directions, then divide each by its standard deviation.
 
+    The reference implementation uses ``V @ diag(1/sqrt(lam)) @ V.T`` instead,
+    which only adds a final rotation back; rotations don't change distances,
+    so both give the same Mahalanobis distances (here also for singular ``S``).
+
     The data is centred (mean subtracted) first; that doesn't change any
     distance but keeps the numbers small.
 
@@ -155,163 +171,191 @@ def _whiten(X: np.ndarray) -> np.ndarray:
     return X_centred @ W
 
 
-def _max_pairwise_distance(Z: np.ndarray, chunk_size: int = 1024) -> float:
-    """Largest Euclidean distance between any two rows of ``Z``.
+def _normalise(d: np.ndarray) -> np.ndarray:
+    """``d / max(d)``, or all zeros if ``d`` has no positive value.
 
-    This is the ``max d`` used to normalise each block in the combined XYOnion
-    distance. Comparing every pair of ``n`` samples needs an ``n x n`` table of
-    distances, which for large ``n`` doesn't fit in memory, so the table is
-    built ``chunk_size`` rows at a time and only its maximum is kept.
+    This is how XYOnion balances X against y: each block's distances are
+    divided by that block's largest distance among the current candidates, so
+    both blocks run from 0 to 1 and carry equal weight. A block with no spread
+    (e.g. constant y) contributes nothing instead of dividing by zero.
+    """
+    top = d.max() if d.size else 0.0
+    return d / top if top > 0 else np.zeros_like(d)
 
-    Each chunk uses the identity
 
-        || a - b ||^2 = ||a||^2 + ||b||^2 - 2 (a . b)
+def _stdsslct(x: np.ndarray, y: np.ndarray, n_select: int) -> np.ndarray:
+    """First stage of DISTSLCT: pick samples that span the main directions.
 
-    which turns all the pairwise distances of a chunk into one matrix product
-    (``chunk @ Z.T`` holds every dot product ``a . b`` at once).
+    Port of ``stdsslct_xyonion`` in ``XYonion.m``. ``x`` and ``y`` must already
+    be centred. Repeatedly:
+
+    1. score every sample by ``|x|^2 / max|x|^2 + y^2 / max y^2`` (how far it is
+       from the centre in X and in y) and pick the highest;
+    2. remove the picked sample and make every other sample's X orthogonal to
+       it (subtract its projection onto the picked sample), and subtract the
+       picked sample's y from every y.
+
+    Step 2 means each new pick lies along a direction the earlier picks don't
+    already cover, which spreads the picks across the data's extremes.
+
+    Returns the indices (into ``x``) of the ``n_select`` picked samples.
+    """
+    x = x.astype(float, copy=True)
+    y = y.astype(float, copy=True)
+    original_index = np.arange(x.shape[0])
+    picked = []
+    for _ in range(n_select):
+        squared_norm_x = np.sum(x**2, axis=1)
+        squared_norm_y = y**2
+        score = _normalise(squared_norm_x) + _normalise(squared_norm_y)
+        k = int(np.argmax(score))            # ties go to the first sample
+        picked.append(int(original_index[k]))
+
+        rx0, ry0 = x[k].copy(), y[k]
+        x = np.delete(x, k, axis=0)
+        y = np.delete(y, k)
+        original_index = np.delete(original_index, k)
+
+        # Remove each sample's component along rx0: x - (x . rx0 / |rx0|^2) rx0.
+        rx0_squared = rx0 @ rx0
+        if rx0_squared > 0:
+            x = x - np.outer((x @ rx0) / rx0_squared, rx0)
+        y = y - ry0
+    return np.array(picked, dtype=int)
+
+
+def distslct(x: np.ndarray, y: np.ndarray, n_select: int) -> np.ndarray:
+    """Pick ``n_select`` spread-out samples on the outside of the data (DISTSLCT).
+
+    Port of ``distslct_xyonion`` in ``XYonion.m``, the layer-selection step of
+    XYOnion.
+
+    1. Centre ``x`` and ``y`` on the samples given (so the centre moves as the
+       data is peeled).
+    2. If fewer samples are wanted than ``x`` has columns, use
+       :func:`_stdsslct` for all of them.
+    3. Otherwise pick the first ``n_features`` with :func:`_stdsslct`, then add
+       samples one at a time: keep, for every sample, the running SUM of its
+       distances (in X, and separately in y) to all samples picked so far, and
+       pick the sample with the largest ``sumX / max sumX + sumY / max sumY``.
+       Samples far from everything already picked score highest, so the picks
+       spread around the outside of the data.
 
     Parameters
     ----------
-    Z : ndarray of shape (n_samples, n_features)
-    chunk_size : int
-        Rows compared per step; memory use is about ``chunk_size * n_samples``
-        numbers.
+    x : ndarray of shape (n, n_features)
+    y : ndarray of shape (n,)
+    n_select : int
+        Number of samples to pick (at most ``n``).
 
     Returns
     -------
-    float
-        The maximum distance, or 0.0 with fewer than 2 samples or no features.
+    ndarray of int
+        Indices (into ``x``) of the picked samples, in the order picked.
     """
-    n_samples = Z.shape[0]
-    if n_samples < 2 or Z.shape[1] == 0:
-        return 0.0
+    n, n_features = x.shape
+    n_select = min(int(n_select), n)
+    if n_select <= 0:
+        return np.array([], dtype=int)
 
-    # ||b||^2 for every row b: square every entry, sum across each row.
-    squared_norms = np.sum(Z**2, axis=1)  # shape (n_samples,)
+    x = x - x.mean(axis=0)
+    y = y - y.mean()
 
-    largest_squared = 0.0
-    for start in range(0, n_samples, chunk_size):
-        chunk = Z[start : start + chunk_size]                  # rows a
-        chunk_norms = squared_norms[start : start + chunk_size]
+    if n_select < n_features:
+        return _stdsslct(x, y, n_select)
 
-        dot_products = chunk @ Z.T                             # a . b for all pairs
-        # Squared distances: column vector + row vector - 2 * dot products.
-        # chunk_norms[:, None] has shape (chunk, 1) and squared_norms[None, :]
-        # has shape (1, n), so adding them gives a (chunk, n) table.
-        squared = chunk_norms[:, None] + squared_norms[None, :] - 2.0 * dot_products
-        largest_squared = max(largest_squared, float(squared.max()))
+    picked = list(_stdsslct(x, y, n_features))
+    is_picked = np.zeros(n, dtype=bool)
+    is_picked[picked] = True
 
-    # Rounding can make a squared distance a tiny bit negative; clip at 0.
-    return float(np.sqrt(max(largest_squared, 0.0)))
+    # Running sums of distances from every sample to the picked ones.
+    sum_dist_x = np.zeros(n)
+    sum_dist_y = np.zeros(n)
+    for p in picked:
+        sum_dist_x += np.linalg.norm(x - x[p], axis=1)
+        sum_dist_y += np.abs(y - y[p])
 
-
-def _safe_inverse(value: float) -> float:
-    """1/value, or 0 when the block has no spread (its term then drops out)."""
-    return 1.0 / value if value > 0 else 0.0
+    while len(picked) < n_select:
+        score = _normalise(np.where(is_picked, 0.0, sum_dist_x)) \
+            + _normalise(np.where(is_picked, 0.0, sum_dist_y))
+        score[is_picked] = -np.inf           # never pick a sample twice
+        k = int(np.argmax(score))
+        picked.append(k)
+        is_picked[k] = True
+        sum_dist_x += np.linalg.norm(x - x[k], axis=1)
+        sum_dist_y += np.abs(y - y[k])
+    return np.array(picked, dtype=int)
 
 
 def xyonion_group_split(
     X: np.ndarray,
     y: np.ndarray,
-    n_test: int,
-    layer_size: int,
-    metric: str,
+    counts,
+    fractions,
+    n_onion: int,
+    loop_fraction: float,
     rng: np.random.RandomState,
-    n_validation: int = 0,
 ):
     """Run XYOnion on one group of samples.
+
+    ``X`` must already be in the space whose Euclidean distance is the chosen
+    metric (i.e. whitened by the caller for Mahalanobis).
 
     Parameters
     ----------
     X : ndarray of shape (n, n_features)
     y : ndarray of shape (n,)
-    n_test : int
-        Exact number of samples of this group to put in the test set.
-    layer_size : int
-        Number of samples per layer (>= 1).
-    metric : {"euclidean", "mahalanobis"}
+    counts : sequence of 3 int
+        Exact number of samples of this group for (train, validation, test).
+        Must add up to ``n``.
+    fractions : sequence of 3 float
+        The overall (train, validation, test) fractions, used for layer sizes.
+    n_onion : int
+        Number of onion rounds (``nonion`` in the reference); each round takes
+        one layer per subset that has a non-zero fraction.
+    loop_fraction : float
+        Fraction of the remaining samples taken per round (``loopfraction`` in
+        the reference, fixed there at 0.1).
     rng : numpy RandomState used for the final random split.
-    n_validation : int, default=0
-        Exact number of samples of this group to put in the validation set.
 
     Returns
     -------
     subset : ndarray of int, shape (n,)
         ``TRAIN`` (0), ``VALIDATION`` (1) or ``TEST`` (2) for each sample.
     layer : ndarray of int, shape (n,)
-        Layer index of each sample (0 = outermost); -1 for samples assigned in
-        the final random split.
+        Layer index of each sample (0 = outermost, i.e. the first train
+        layer); -1 for samples assigned in the final random split.
     """
     n = X.shape[0]
-    if n_test < 0 or n_validation < 0 or n_test + n_validation > n:
-        raise ValueError(
-            f"n_test={n_test} and n_validation={n_validation} must be >= 0 and "
-            f"add up to at most {n}."
-        )
-    if layer_size < 1:
-        raise ValueError(f"layer_size={layer_size} must be >= 1.")
-    if metric not in METRICS:
-        raise ValueError(f"metric must be one of {METRICS}, got {metric!r}.")
+    target = np.asarray(counts, dtype=int)
+    if target.shape != (3,) or (target < 0).any() or target.sum() != n:
+        raise ValueError(f"counts={list(counts)} must be 3 non-negative ints adding up to {n}.")
+    if n_onion < 0:
+        raise ValueError(f"n_onion={n_onion} must be >= 0.")
 
     subset = np.full(n, TRAIN, dtype=int)
     layer = np.full(n, -1, dtype=int)
-    if n == 0:
-        return subset, layer
-
-    # Put both blocks in a space where plain Euclidean distance is the chosen
-    # metric, then scale each block by the inverse of its max pairwise distance.
-    if metric == "mahalanobis":
-        Zx = _whiten(X)
-        y_std = y.std(ddof=1) if n > 1 else 0.0
-        zy = (y - y.mean()) * _safe_inverse(y_std)
-    else:
-        Zx = X.astype(float, copy=True)
-        zy = y.astype(float, copy=True)
-    Zx = Zx * _safe_inverse(_max_pairwise_distance(Zx))
-    zy = zy * _safe_inverse(float(np.ptp(zy)) if n > 1 else 0.0)
-
-    if metric == "mahalanobis":
-        fixed_centroid = (Zx.mean(axis=0), zy.mean())
-
-    target = np.array([n - n_validation - n_test, n_validation, n_test])
-    target_share = target / n
     count = np.zeros(3, dtype=int)
     remaining = np.arange(n)
     layer_id = 0
 
-    while remaining.size >= layer_size:
-        assigned = count.sum()
-        fits = count + layer_size <= target
-        if not fits.any():
-            break
-        if layer_id == 0 and fits[TRAIN]:
-            # The outermost layer always goes to train, so neither validation
-            # nor test ever needs extrapolating to.
-            destination = TRAIN
-        else:
-            # How far each subset would be below its target share if this
-            # layer went elsewhere. Give the layer to the biggest shortfall
-            # among the subsets it fits in; ties go to train, then validation.
-            shortfall = target_share * (assigned + layer_size) - count
-            shortfall[~fits] = -np.inf
-            destination = int(np.argmax(shortfall))
+    for _ in range(n_onion):
+        # Layer sizes come from the samples left at the START of the round.
+        m0 = remaining.size
+        sizes = {s: round_half_up(loop_fraction * m0 * fractions[s]) for s in LAYER_ORDER}
+        for s in LAYER_ORDER:
+            size = min(sizes[s], target[s] - count[s], remaining.size)
+            if size <= 0:
+                continue
+            picked = distslct(X[remaining], y[remaining], size)
+            chosen = remaining[picked]
+            subset[chosen] = s
+            layer[chosen] = layer_id
+            count[s] += size
+            remaining = np.delete(remaining, picked)
+            layer_id += 1
 
-        if metric == "mahalanobis":
-            cx, cy = fixed_centroid
-        else:
-            cx, cy = Zx[remaining].mean(axis=0), zy[remaining].mean()
-        dist = np.linalg.norm(Zx[remaining] - cx, axis=1) + np.abs(zy[remaining] - cy)
-        # Stable sort, so ties go to the lower original index (deterministic).
-        order = np.argsort(-dist, kind="stable")
-        chosen = remaining[order[:layer_size]]
-        remaining = remaining[np.sort(order[layer_size:])]
-
-        subset[chosen] = destination
-        layer[chosen] = layer_id
-        count[destination] += layer_size
-        layer_id += 1
-
-    # Final random split of the core samples, hitting every count exactly.
+    # Final random split of what's left, hitting every count exactly.
     still_needed_test = target[TEST] - count[TEST]
     if still_needed_test:
         picked = rng.choice(remaining, size=still_needed_test, replace=False)

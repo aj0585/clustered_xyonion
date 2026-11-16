@@ -2,9 +2,11 @@
 
 Four well-separated blobs, each stretched 4:1 in its own direction, with a
 response that is constant within each blob (see below for why).
-Euclidean layers are circles, so they peel the two long ends of each blob
-first and leave its sides for later. Mahalanobis layers follow each blob's own
-shape (its covariance), so they peel evenly all the way round.
+With Euclidean distance the long ends of each blob are the "outside", so the
+layers come mostly from the ends and the unlayered core is rounder. With
+Mahalanobis distance each blob is first whitened with its own covariance, so
+the layers form an even rim all the way round and the unlayered core keeps the
+blob's stretched shape.
 
 Also shows a plain train/test split (validation_fraction=0) next to a
 train/validation/test split.
