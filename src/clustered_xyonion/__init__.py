@@ -6,7 +6,7 @@ __all__ = [
     "xyonion_train_val_test_split",
     "HDBSCAN_KNN",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _SOURCES = {
     "XYOnionSplit": "xyonion",

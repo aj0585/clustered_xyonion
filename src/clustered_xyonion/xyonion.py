@@ -21,6 +21,7 @@ from ._core import (
     TEST,
     TRAIN,
     VALIDATION,
+    _whiten,
     apportion_counts,
     round_half_up,
     xyonion_group_split,
@@ -75,14 +76,24 @@ class XYOnionSplit(BaseCrossValidator):
     validation_fraction : float in [0, 1), default=0.0
         Fraction of samples placed in the validation set (0 = no validation
         set). ``test_fraction + validation_fraction`` must be below 1.
+    n_onion : int >= 0, default=3
+        Number of onion rounds (``nonion`` in the reference implementation).
+        Each round peels one layer per subset, in the order train, test,
+        validation. Samples left after the last round are split at random.
     loop_fraction : float in (0, 1], default=0.1
-        Sets the layer size: each layer holds
-        ``max(1, round(loop_fraction * f * n_k))`` samples, where ``n_k`` is
-        the size of the cluster being split and ``f`` is the smaller of the
-        non-zero held-out fractions (``test_fraction``, and
-        ``validation_fraction`` if used).
+        Fraction of the remaining samples peeled per round (fixed at 0.1 in
+        the reference implementation). In each round, the layer for a subset
+        holds ``round(loop_fraction * m0 * f)`` samples, where ``m0`` is the
+        number of the cluster's samples still unassigned at the start of the
+        round and ``f`` is that subset's fraction (train's fraction is
+        ``1 - test_fraction - validation_fraction``). So layers shrink round by
+        round, and with the defaults about 27% of each cluster is layered.
     metric : {"euclidean", "mahalanobis"}, default="euclidean"
-        Distance used in the X and y blocks within each cluster.
+        Distance used for X within each cluster. Mahalanobis whitens each
+        cluster with its own covariance (pseudoinverse, so singular
+        covariances work). y is always compared by absolute difference; its
+        scale doesn't matter because X and y distances are each divided by
+        their maximum before being added.
     clustering : {None, "kmeans", "hdbscan"} or estimator, default=None
         Pre-clustering step, run on X only. ``None`` runs plain XYOnion on the
         whole data set. ``"kmeans"`` uses ``sklearn.cluster.KMeans``;
@@ -104,6 +115,7 @@ class XYOnionSplit(BaseCrossValidator):
         self,
         test_fraction=0.25,
         validation_fraction=0.0,
+        n_onion=3,
         loop_fraction=0.1,
         metric="euclidean",
         clustering=None,
@@ -112,6 +124,7 @@ class XYOnionSplit(BaseCrossValidator):
     ):
         self.test_fraction = test_fraction
         self.validation_fraction = validation_fraction
+        self.n_onion = n_onion
         self.loop_fraction = loop_fraction
         self.metric = metric
         self.clustering = clustering
@@ -135,6 +148,9 @@ class XYOnionSplit(BaseCrossValidator):
                 f"test_fraction + validation_fraction must be below 1, got "
                 f"{self.test_fraction} + {vf}."
             )
+        if not (isinstance(self.n_onion, Integral) and not isinstance(self.n_onion, bool)
+                and self.n_onion >= 0):
+            raise ValueError(f"n_onion must be an int >= 0, got {self.n_onion!r}.")
         if not (_is_float(self.loop_fraction) and 0 < self.loop_fraction <= 1):
             raise ValueError(
                 f"loop_fraction must be a float in (0, 1], got {self.loop_fraction!r}."
@@ -225,18 +241,21 @@ class XYOnionSplit(BaseCrossValidator):
         n_test_per_group = apportion_counts(sizes, tf)
         n_val_per_group = apportion_counts(sizes, vf, capacity=sizes - n_test_per_group)
 
-        # Layer size is set by the smallest held-out set, so it gets several
-        # layers rather than one or two big ones.
-        layer_fraction = min(tf, vf) if vf > 0 else tf
+        # (train, validation, test) fractions, used for the layer sizes.
+        fractions = (1.0 - tf - vf, vf, tf)
 
         rng = check_random_state(self.random_state)
         subset = np.full(n_samples, TRAIN, dtype=int)
         layer = np.full(n_samples, -1, dtype=int)
         for idx, n_test, n_val in zip(members, n_test_per_group, n_val_per_group):
-            layer_size = max(1, round_half_up(self.loop_fraction * layer_fraction * idx.size))
+            # Mahalanobis: whiten each cluster with its own covariance, so plain
+            # Euclidean distance inside the core is the cluster's Mahalanobis
+            # distance.
+            X_group = _whiten(X[idx]) if self.metric == "mahalanobis" else X[idx]
+            counts = (idx.size - int(n_test) - int(n_val), int(n_val), int(n_test))
             group_subset, group_layer = xyonion_group_split(
-                X[idx], y[idx], int(n_test), layer_size, self.metric, rng,
-                n_validation=int(n_val),
+                X_group, y[idx], counts, fractions, self.n_onion,
+                self.loop_fraction, rng,
             )
             subset[idx] = group_subset
             layer[idx] = group_layer
@@ -291,6 +310,7 @@ def xyonion_train_test_split(
     y,
     *arrays,
     test_fraction=0.25,
+    n_onion=3,
     loop_fraction=0.1,
     metric="euclidean",
     clustering=None,
@@ -308,7 +328,7 @@ def xyonion_train_test_split(
     X : array-like of shape (n_samples, n_features)
     y : array-like of shape (n_samples,) or (n_samples, 1)
     *arrays : further indexables with the same number of samples
-    test_fraction, loop_fraction, metric, clustering, clustering_params, random_state
+    test_fraction, n_onion, loop_fraction, metric, clustering, clustering_params, random_state
         See :class:`XYOnionSplit`.
 
     Returns
@@ -320,6 +340,7 @@ def xyonion_train_test_split(
     X, y, *arrays = indexable(X, y, *arrays)
     info = XYOnionSplit(
         test_fraction=test_fraction,
+        n_onion=n_onion,
         loop_fraction=loop_fraction,
         metric=metric,
         clustering=clustering,
@@ -335,6 +356,7 @@ def xyonion_train_val_test_split(
     *arrays,
     test_fraction=0.2,
     validation_fraction=0.2,
+    n_onion=3,
     loop_fraction=0.1,
     metric="euclidean",
     clustering=None,
@@ -354,7 +376,7 @@ def xyonion_train_val_test_split(
     *arrays : further indexables with the same number of samples
     test_fraction : float in (0, 1), default=0.2
     validation_fraction : float in (0, 1), default=0.2
-    loop_fraction, metric, clustering, clustering_params, random_state
+    n_onion, loop_fraction, metric, clustering, clustering_params, random_state
         See :class:`XYOnionSplit`.
 
     Returns
@@ -371,6 +393,7 @@ def xyonion_train_val_test_split(
     info = XYOnionSplit(
         test_fraction=test_fraction,
         validation_fraction=validation_fraction,
+        n_onion=n_onion,
         loop_fraction=loop_fraction,
         metric=metric,
         clustering=clustering,

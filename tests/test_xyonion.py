@@ -75,18 +75,40 @@ def test_clustered_split_is_stratified_per_cluster():
         assert (info.subset[in_g & (info.layer == 0)] == TRAIN).all()
 
 
-def test_layer_size_follows_loop_fraction():
+def layer_sizes_and_subsets(info):
+    ids = range(info.layer.max() + 1)
+    sizes = [int((info.layer == k).sum()) for k in ids]
+    kinds = [int(info.subset[info.layer == k][0]) for k in ids]
+    return sizes, kinds
+
+
+def test_layer_sizes_follow_reference():
+    # Each round: train layer round(0.1 * m0 * 0.75), then test layer
+    # round(0.1 * m0 * 0.25), m0 = samples left at the start of the round.
     X, y = make_data(400)
-    info = XYOnionSplit(test_fraction=0.25, loop_fraction=0.1, random_state=0).split_info(X, y)
-    sizes = np.bincount(info.layer[info.layer >= 0])
-    assert (sizes == 10).all()  # round(0.1 * 0.25 * 400)
+    info = XYOnionSplit(test_fraction=0.25, random_state=0).split_info(X, y)
+    sizes, kinds = layer_sizes_and_subsets(info)
+    assert sizes == [30, 10, 27, 9, 24, 8]  # m0 = 400, 360, 324
+    assert kinds == [TRAIN, TEST] * 3
+    assert (info.subset == TEST).sum() == 100  # random core makes it exact
 
 
-def test_tiny_sample_uses_layers_of_one():
+def test_n_onion_sets_number_of_rounds():
+    X, y = make_data(400)
+    for n_onion in (0, 1, 5):
+        info = XYOnionSplit(n_onion=n_onion, random_state=0).split_info(X, y)
+        assert len(layer_sizes_and_subsets(info)[0]) == 2 * n_onion
+        assert (info.subset == TEST).sum() == 100
+
+
+def test_tiny_sample_skips_empty_layers():
+    # 12 samples: train layers round(0.1 * m0 * 0.75) = 1 each round, test
+    # layers round(0.1 * m0 * 0.25) = 0 so they're skipped; test comes from
+    # the random core.
     X, y = make_data(12)
-    info = XYOnionSplit(test_fraction=0.25, loop_fraction=0.1, random_state=0).split_info(X, y)
-    sizes = np.bincount(info.layer[info.layer >= 0])
-    assert (sizes == 1).all()
+    info = XYOnionSplit(test_fraction=0.25, random_state=0).split_info(X, y)
+    sizes, kinds = layer_sizes_and_subsets(info)
+    assert sizes == [1, 1, 1] and kinds == [TRAIN] * 3
     assert (info.subset == TEST).sum() == 3
 
 
@@ -256,12 +278,26 @@ def test_three_way_is_stratified_per_cluster():
         assert (info.subset[in_g & (info.layer == 0)] == TRAIN).all()
 
 
-def test_layer_size_uses_smaller_held_out_fraction():
+def test_three_way_layers_go_train_test_validation():
+    # train 0.65, test 0.25, validation 0.1; loop_fraction 0.5 so m0 halves.
     X, y = make_data(400)
     info = XYOnionSplit(test_fraction=0.25, validation_fraction=0.1,
                         loop_fraction=0.5, random_state=0).split_info(X, y)
-    sizes = np.bincount(info.layer[info.layer >= 0])
-    assert (sizes == 20).all()  # round(0.5 * min(0.25, 0.1) * 400)
+    sizes, kinds = layer_sizes_and_subsets(info)
+    assert sizes == [130, 50, 20, 65, 25, 10, 33, 13, 5]  # m0 = 400, 200, 100
+    assert kinds == [TRAIN, TEST, VALIDATION] * 3
+    assert np.bincount(info.subset, minlength=3).tolist() == [260, 40, 100]
+
+
+def test_mahalanobis_ignores_feature_scaling_euclidean_does_not():
+    # Stretching one feature changes which samples look "outer" in Euclidean
+    # distance, but whitening undoes the stretch, so Mahalanobis layers match.
+    X, y = make_data(300)
+    X_stretched = X * [1.0, 50.0]
+    for metric, same in (("mahalanobis", True), ("euclidean", False)):
+        a = XYOnionSplit(metric=metric, random_state=0).split_info(X, y)
+        b = XYOnionSplit(metric=metric, random_state=0).split_info(X_stretched, y)
+        assert np.array_equal(a.layer, b.layer) == same
 
 
 def test_validation_zero_matches_two_way():

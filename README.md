@@ -8,9 +8,12 @@ clusters).
 XYOnion (Ezenarro, *Anal. Chim. Acta* 1364 (2025) 344229,
 [doi:10.1016/j.aca.2025.344229](https://doi.org/10.1016/j.aca.2025.344229))
 combines SPXY-style joint X–y distances with Onion-style layered selection:
-samples are peeled off in shells from the outside in, the outermost shell goes
-to training (so validation and test are never extrapolated), and later layers
-are shared out between the subsets so every subset spans the whole data space.
+in a few rounds, spread-out samples are peeled off the outside of the data and
+given in turn to train, test and validation (train first, so validation and
+test are not extrapolated); the remaining core is split at random. This
+package follows the author's reference MATLAB implementation
+([JokinEzenarro/XYOnion](https://github.com/JokinEzenarro/XYOnion)), with the
+extensions listed under [How it works](#how-it-works).
 
 Standard XYOnion assumes the data set is roughly convex. The clustered variant
 first gives every sample a hard cluster label (kmeans or HDBSCAN + KNN), runs
@@ -36,6 +39,7 @@ from clustered_xyonion import (
 X_train, X_test, y_train, y_test = xyonion_train_test_split(
     X, y,
     test_fraction=0.25,
+    n_onion=3,
     loop_fraction=0.1,
     metric="mahalanobis",          # or "euclidean"
     clustering="kmeans",           # or "hdbscan", None, or your own clusterer
@@ -72,8 +76,9 @@ info.cluster_labels, info.layer, info.clusterer
 |---|---|---|
 | `test_fraction` | `0.25` | Fraction of samples in the test set, in (0, 1). |
 | `validation_fraction` | `0.0` | Fraction in the validation set, in [0, 1); 0 = no validation set. `test_fraction + validation_fraction` must be below 1. |
-| `loop_fraction` | `0.1` | Layer size is `max(1, round(loop_fraction * f * n_k))` for a cluster of `n_k` samples, where `f` is the smaller of the non-zero held-out fractions. |
-| `metric` | `"euclidean"` | `"euclidean"` or `"mahalanobis"`, used within each cluster. |
+| `n_onion` | `3` | Number of onion rounds (`nonion` in the reference). Each round peels one layer for train, then test, then validation. |
+| `loop_fraction` | `0.1` | Fraction of the remaining samples peeled per round (fixed at 0.1 in the reference). A subset's layer holds `round(loop_fraction * m0 * f)` samples, `m0` being the cluster's samples still unassigned at the start of the round and `f` that subset's fraction. |
+| `metric` | `"euclidean"` | `"euclidean"` or `"mahalanobis"` for X, within each cluster. |
 | `clustering` | `None` | `None`, `"kmeans"`, `"hdbscan"`, or any estimator with `fit_predict`. |
 | `clustering_params` | `None` | Dict of keyword arguments for the clustering algorithm. |
 | `random_state` | `None` | Seeds the random core split and, unless set explicitly, the clusterer's `random_state`. |
@@ -113,36 +118,37 @@ in a window too. They need matplotlib (the `examples` dependency group).
 | `01_strings_plain_vs_kmeans.py` | Why cluster first: plain vs kmeans + XYOnion on string-like clusters |
 | `02_blobs_euclidean_vs_mahalanobis.py` | Euclidean vs Mahalanobis layers on stretched blobs; train/test vs train/validation/test |
 | `03_moons_hdbscan_knn.py` | HDBSCAN_KNN on moons + blob + noise (pretend labels until it's implemented) |
-| `04_loop_fraction.py` | Thin vs thick layers as `loop_fraction` changes |
+| `04_n_onion_and_loop_fraction.py` | How much of the data is layered as `n_onion` and `loop_fraction` change |
 | `05_helices_3d_kmeans.py` | kmeans + XYOnion on 3D helices |
 
 ```bash
 uv run --group examples python examples/01_strings_plain_vs_kmeans.py
 ```
 
-Each figure shows the response, the clusters, the onion-layer depth within
-each cluster, the split, and the response range of each subset (dashed lines
-mark the train range; values outside it are counted).
+Each figure shows the response, the clusters, the onion layers within each
+cluster (grey dots are the unlayered core, split at random), the split, and
+the response range of each subset (dashed lines mark the train range; values
+outside it are counted).
 
 ### Why cluster first
 
-Plain XYOnion treats the three strings as one cloud, so its layers cut across
-them:
+Plain XYOnion treats the three strings as one cloud, so its layers come from
+the outside of that cloud (the string ends and the outer strings) and the
+middle string is hardly layered:
 
 ![Plain XYOnion on string-like clusters](examples/output/01_strings_plain.png)
 
-With kmeans first, each piece of each string gets its own onion. Note the one
-validation sample just above the train range: with thin layers the outermost
-layer doesn't always contain a cluster's y extremes, so the no-extrapolation
-property isn't strict.
+With kmeans first, each piece of each string gets its own onion, so every
+piece's extremes go to train:
 
 ![kmeans + XYOnion on string-like clusters](examples/output/01_strings_kmeans.png)
 
 ### Euclidean vs Mahalanobis
 
 The response is constant within each blob here, so the layers show the X
-metric alone. Euclidean layers are round, peeling each blob's long ends first;
-Mahalanobis layers follow each blob's shape.
+metric alone. With Euclidean distance the layers come mostly from each blob's
+long ends and the unlayered core is rounder; with Mahalanobis distance they
+form an even rim all round and the core keeps the blob's shape.
 
 ![Euclidean layers on stretched blobs](examples/output/02_blobs_euclidean.png)
 
@@ -154,41 +160,59 @@ Mahalanobis layers follow each blob's shape.
 
 ![HDBSCAN_KNN + XYOnion on moons and a blob](examples/output/03_moons_hdbscan_knn.png)
 
-### loop_fraction
+### n_onion and loop_fraction
 
-![Effect of loop_fraction on layers and split](examples/output/04_loop_fraction.png)
+With the reference defaults (3 rounds of 10%) about 27% of the data is
+layered; more rounds or a larger `loop_fraction` layer more of it.
+
+![Effect of n_onion and loop_fraction on layers and split](examples/output/04_n_onion_and_loop_fraction.png)
 
 ### 3D
 
 ![kmeans + XYOnion on 3D helices](examples/output/05_helices_3d_kmeans.png)
 
-## Assumptions
+## How it works
 
-The paper leaves some details open, and the author's Matlab code is available
-only on request. Until it is available, the implementation uses these rules,
-all in `xyonion_group_split` in `src/clustered_xyonion/_core.py`:
+Within each cluster (or the whole data set without clustering), following the
+reference implementation `XYonion.m`; the code is in
+`src/clustered_xyonion/_core.py`:
 
-1. **Distance:** `d(p, q) = d_x(p, q) / max d_x + d_y(p, q) / max d_y`, with the
-   maxima being the largest pairwise distances in the cluster. Mahalanobis uses
-   the pseudoinverse of the cluster's X covariance and `var(y)`.
-2. **Layer membership:** each layer takes the remaining samples furthest from
-   the centroid by that combined distance. For Euclidean, the centroid is
-   recomputed from the remaining samples at each layer; for Mahalanobis it is
-   computed once from the whole cluster.
-3. **Layer size:** `round(loop_fraction * f * n_k)`, `f` being the smaller
-   non-zero held-out fraction, or 1 sample per layer when that rounds to 0
-   (small clusters).
-4. **Layer assignment:** the first layer goes to train. Each later layer goes
-   to whichever subset is furthest below its target share, without exceeding
-   any subset's exact count (ties go to train, then validation). With two
-   subsets this is the same as keeping the running test ratio closest to
-   `test_fraction`.
-5. **Final split:** samples left over when a full layer no longer fits are
-   split at random so each subset's count in the cluster is exact.
-6. **Rounding:** the overall counts are `round(test_fraction * n_samples)` and
-   `round(validation_fraction * n_samples)` (halves round up), shared between
-   clusters by the largest-remainder method so the totals are exact and no
-   cluster's validation + test exceeds its size.
+1. **Rounds and layer sizes:** `n_onion` rounds. At the start of each round,
+   with `m0` samples still unassigned, the round peels a train layer of
+   `round(loop_fraction * m0 * train_fraction)` samples, then a test layer of
+   `round(loop_fraction * m0 * test_fraction)`, then (if requested) a
+   validation layer of `round(loop_fraction * m0 * validation_fraction)`.
+   Train always goes first, so the outermost samples are in train.
+2. **Layer selection (DISTSLCT):** each layer is picked by DISTSLCT on the
+   samples still unassigned, with X and y re-centred on those samples. The
+   first picks (as many as X has columns) are the samples furthest from the
+   centre, each new one orthogonal to the earlier ones; after that, each pick
+   is the sample with the largest summed distance to everything picked so
+   far. This spreads the layer around the outside of the data.
+3. **Balancing X and y:** at every pick the X distances and y distances are
+   each divided by their maximum over the candidates, then added, so X and y
+   carry equal weight (and y's units don't matter).
+4. **Mahalanobis:** each cluster is whitened with its own covariance before
+   step 1, so Euclidean distance on the result is the cluster's Mahalanobis
+   distance.
+5. **Random core:** the samples left after the last round are split at
+   random.
+
+Where this differs from `XYonion.m`, deliberately:
+
+- **Clustering** and a **validation** set (the reference only has
+  calibration/validation, i.e. train/test).
+- **Exact counts:** the overall counts are `round(test_fraction * n_samples)`
+  and `round(validation_fraction * n_samples)` (halves round up), shared
+  between clusters by the largest-remainder method; no layer may overshoot a
+  subset's count and the random core makes up the rest exactly. The reference
+  rounds per layer and then uses `ceil`, so its counts are approximate.
+- `loop_fraction` is a parameter (fixed at 0.1 in the reference), and
+  `random_state` controls the random core.
+- **Mahalanobis** uses the pseudoinverse (singular covariances work) and is
+  computed per cluster.
+- **Robustness:** DISTSLCT never picks the same sample twice, and a block with
+  no spread (e.g. constant y) contributes nothing instead of dividing by zero.
 
 ## Development
 
@@ -198,3 +222,20 @@ uv run python -m pytest
 
 `tests/test_core.py` needs only numpy; `tests/test_xyonion.py` needs
 scikit-learn and pandas.
+
+## Citation and license
+
+XYOnion is the method of Ezenarro (2025). If you use this package, please
+cite the original article:
+
+> Ezenarro, J. (2025). *XYOnion: a layer-based method for splitting datasets
+> into calibration and validation subsets*. Analytica Chimica Acta, 1364,
+> 344229. https://doi.org/10.1016/j.aca.2025.344229
+
+The author's reference MATLAB implementation is at
+<https://github.com/JokinEzenarro/XYOnion>.
+
+This package is released under the MIT License (see `LICENSE.txt`), which
+keeps the reference implementation's copyright and permission notice. The
+article in `papers/xyonion.pdf` is not covered by the MIT License; it remains
+under its published CC BY-NC-ND 4.0 license.

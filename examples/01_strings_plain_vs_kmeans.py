@@ -1,11 +1,11 @@
 """Why cluster first: plain XYOnion vs kmeans + XYOnion on string-like data.
 
 Three long, wavy strings. Plain XYOnion treats the whole data set as one
-cloud, so its onion layers cut across the strings: the string ends and the
-outer strings are peeled first and the middle string ends up deep inside.
+cloud, so its layers come from the outside of that cloud: the string ends and
+the outer strings, while the middle string is hardly layered at all.
 With kmeans first (enough clusters to cut each string into roughly convex
-pieces), every piece gets its own onion, so train, validation and test are
-spread along every string.
+pieces), every piece gets its own onion, so every piece's extremes go to train
+and the layers are spread along every string.
 
 Run:  uv run --group examples python examples/01_strings_plain_vs_kmeans.py
 """
